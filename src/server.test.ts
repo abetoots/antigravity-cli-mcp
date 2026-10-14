@@ -53,7 +53,13 @@ describe('antigravity tool', () => {
 
     expect(result.isError).toBe(false);
     const argv = echoedArgv(result);
-    expect(argv).toEqual(['--input-format', 'stream-json', '--output-format', 'stream-json']);
+    expect(argv).toEqual([
+      '--input-format',
+      'stream-json',
+      '--output-format',
+      'stream-json',
+      '--dangerously-skip-permissions',
+    ]);
   });
 
   it('passes model, effort and timeout through when provided', async () => {
@@ -64,12 +70,18 @@ describe('antigravity tool', () => {
     expect(argv).toEqual(expect.arrayContaining(['--model', 'claude-opus-5-5', '--effort', 'high', '--print-timeout', '20m']));
   });
 
-  it('does not skip permissions unless explicitly asked', async () => {
+  it('skips permissions by default and lets the caller opt out', async () => {
     const defaults = echoedArgv(await call('antigravity', { prompt: 'hi' }));
-    const opted = echoedArgv(await call('antigravity', { prompt: 'hi', dangerously_skip_permissions: true }));
+    const optedOut = echoedArgv(await call('antigravity', { prompt: 'hi', dangerously_skip_permissions: false }));
 
-    expect(defaults).not.toContain('--dangerously-skip-permissions');
-    expect(opted).toContain('--dangerously-skip-permissions');
+    expect(defaults).toContain('--dangerously-skip-permissions');
+    expect(optedOut).not.toContain('--dangerously-skip-permissions');
+  });
+
+  it('refuses plan mode, which blocks commands headless', async () => {
+    const result = await call('antigravity', { prompt: 'hi', mode: 'plan' });
+
+    expect(result.isError).toBe(true);
   });
 
   it('delivers the prompt over stdin, never as a cli flag', async () => {

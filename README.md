@@ -2,20 +2,24 @@
 
 Local stdio MCP server that runs the Google Antigravity CLI (`agy`) in headless mode.
 
-It is a thin wrapper: **model, reasoning effort, time limit, and permissions come from the CLI's own
-configuration unless a call overrides them.** Nothing is pinned by the server.
+It is a thin wrapper: **model, reasoning effort and time limit come from the CLI's own configuration
+unless a call overrides them.** Nothing is pinned by the server. The exception is permissions, which are
+auto-approved by default because headless runs can't prompt and reviewers need to run commands.
 
 | Setting | Default when not passed | Override |
 |---|---|---|
 | Model | `"model"` in `~/.gemini/antigravity-cli/settings.json` (what `/model` sets) | `model` |
 | Effort | the selected model's default | `effort` (`low`…`max`, validated by the CLI per model) |
 | Time limit | none: `--print-timeout` defaults to `0s` ("waits until the turn completes") in agy ≥1.3 | `timeout` (e.g. `"20m"`) |
-| Permissions | CLI settings (`toolPermission`, `permissions.allow`); anything else is auto-denied headless | `dangerously_skip_permissions` |
+| Permissions | auto-approved (`--dangerously-skip-permissions`) | `dangerously_skip_permissions: false` to follow CLI settings (`toolPermission`, `permissions.allow`); anything else is auto-denied headless |
 
 ## Tools
 
 - `antigravity`: start a session. Params: `prompt` plus optional `model`, `effort`, `timeout`, `cwd`, `add_dirs`, `mode`, `sandbox`, `dangerously_skip_permissions`.
 - `antigravity-reply`: continue a session by `conversation_id`, with the same optional overrides.
+
+`mode` only offers `accept-edits`. Plan mode is left out on purpose: headless, it blocks running commands and
+reading URLs even with permissions skipped, so the agent returns an empty response.
 
 Both return the final response as text plus `structuredContent` (`conversation_id`, `status`, `usage`, `denied_actions`, …).
 They send MCP progress notifications on each tool step (plus a 10s keepalive), and cancelling the call kills the `agy` process.

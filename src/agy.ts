@@ -8,7 +8,7 @@ import { createInterface } from 'node:readline';
 const PRINT_TIMEOUT_NOTICE = /print timeout after (\S+) with turn in progress/;
 
 export type Effort = 'low' | 'medium' | 'high' | 'xhigh' | 'max';
-export type Mode = 'accept-edits' | 'plan';
+export type Mode = 'accept-edits';
 
 export interface AgyOptions {
   prompt: string;

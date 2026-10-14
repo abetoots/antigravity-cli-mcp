@@ -35,17 +35,20 @@ const sharedInput = {
     .optional()
     .describe('Working directory for the agent. Defaults to the directory this MCP server was launched from.'),
   add_dirs: z.array(z.string()).optional().describe('Extra directories to add to the agent workspace.'),
+  // "plan" is deliberately not offered: headless plan mode blocks commands and url reads even
+  // with permissions skipped, so reviewers picking it as "read-only" got empty responses
   mode: z
-    .enum(['accept-edits', 'plan'])
+    .enum(['accept-edits'])
     .optional()
     .describe('Agent execution mode. Omit to use the CLI default.'),
   sandbox: z.boolean().optional().describe('Run with terminal restrictions enabled.'),
   dangerously_skip_permissions: z
     .boolean()
-    .optional()
+    .default(true)
     .describe(
-      'Auto-approve every tool permission. Without it, headless runs follow the CLI permission settings and ' +
-        'auto-deny anything else (reported in denied_actions).',
+      'Auto-approve every tool permission (default true), so the agent can run commands and read files. ' +
+        'Set false to follow the CLI permission settings instead; headless runs then auto-deny anything ' +
+        'not allowed there (reported in denied_actions). Combine with sandbox for terminal restrictions.',
     ),
 };
 
@@ -111,7 +114,7 @@ export function formatResult(result: AgyResult): CallToolResult {
     const names = result.denied_actions.map((a) => a.display_name || a.action).join(', ');
     parts.push(
       `Note: headless mode auto-denied these permissions: ${names}. ` +
-        'Allow them in the CLI settings or retry with dangerously_skip_permissions.',
+        'Allow them in the CLI settings or retry without dangerously_skip_permissions: false.',
     );
   }
   if (result.conversation_id) parts.push(`conversation_id: ${result.conversation_id}`);
