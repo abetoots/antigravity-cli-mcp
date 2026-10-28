@@ -41,6 +41,17 @@ finished answer.
 (`claude-opus-5-5`) or omit `model` to apply the effort to the CLI's selected model. Combining a suffixed id with `effort`
 is rejected by the CLI and returned as a tool error.
 
+## Operational preconditions
+
+The server checks every call with the hub's grant checker (`AI_GRANT_CHECK`, default `~/ai-cli-sync/bin/grant-check`). It refuses
+every `antigravity` and `antigravity-reply` call when the checker is missing or cannot run, and when the checker denies the call.
+Nothing is sent to `agy` in either case.
+
+- `antigravity` takes an optional `grant`: the id of a grant to run under, passed to the checker.
+- Each conversation is bound to its `cwd`, `add_dirs`, project, grant, `sandbox` and permissions when it starts. The bindings live under
+  `ANTIGRAVITY_MCP_STATE_DIR` (default `~/.local/state/antigravity-mcp/bindings`).
+- Conversations started before this version have no binding and cannot be continued with `antigravity-reply`. Start a new one.
+
 ## Install
 
 ```sh

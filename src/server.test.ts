@@ -7,6 +7,7 @@ import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { runAgy as realRunAgy, type AgyOptions } from './agy.js';
 import { loadBinding, saveBinding, type ConversationBinding } from './conversation-binding.js';
+import { fromWire, type GrantClient } from './grant-client.js';
 import { createServer } from './server.js';
 
 const FAKE_AGY = resolve(import.meta.dirname, '../test/fake-agy.mjs');
@@ -88,10 +89,11 @@ beforeEach(async () => {
 });
 
 // a new wrapper instance over the same binding store, like a restart
-async function connectServer(calls: AgyOptions[]): Promise<Client> {
+async function connectServer(calls: AgyOptions[], grants?: GrantClient): Promise<Client> {
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   await createServer({
     keepaliveMs: 50,
+    grants,
     runAgy: (opts, hooks) => {
       calls.push(opts);
       return realRunAgy(opts, hooks);
@@ -245,8 +247,10 @@ describe('antigravity tool', () => {
       onprogress: (p) => messages.push(p.message),
     });
 
-    // the grant check before spawn can outlast one keepalive tick, which reports 'working'
-    expect(messages.filter((m) => m !== 'working')).toEqual(['running view_file', 'responding']);
+    // the grant check before spawn can outlast one keepalive tick, which reports 'working', and under
+    // load a keepalive can repeat a step, so consecutive duplicates collapse before the order check
+    const steps = messages.filter((m) => m !== 'working').filter((m, i, all) => m !== all[i - 1]);
+    expect(steps).toEqual(['running view_file', 'responding']);
   });
 
   it('keeps sending progress during a silent step so idle timeouts do not fire', async () => {
@@ -407,49 +411,82 @@ describe('antigravity-reply tool', () => {
     expect(agyCalls).toHaveLength(0);
   });
 
-  // holds the first turn open on the gate, queues a second reply behind it, revokes while it waits
-  // (proved by keepalive ticks, no sleeps), then releases. the recheck must run after the wait
-  async function revokeWhileQueued(c: Client, calls: AgyOptions[]): Promise<void> {
+  // holds the first turn open on the gate, queues a second reply behind it, waits three keepalive
+  // ticks, optionally revokes, then releases. the second reply must be checked once, after the wait.
+  // the grants are an in-process stub, so the "no check yet" window does not depend on a subprocess
+  async function queueBehindHeldTurn(revoke: boolean, restart: boolean): Promise<void> {
+    await seed({ grantId: 'g1', grantRevision: 1 });
+    if (restart) {
+      // a first instance served a reply and went away; a new one reads the same store
+      expect((await call('antigravity-reply', { conversation_id: 'conv-9', prompt: 'one' })).isError).toBe(false);
+      await client.close();
+    }
+    let revoked = false;
+    const stubCalls: Record<string, unknown>[] = [];
+    const grants = {
+      check: async (req: Record<string, unknown>) => {
+        stubCalls.push(req);
+        return fromWire(wireDecision(revoked ? { allowed: false, reason: 'revoked' } : {}));
+      },
+    } as unknown as GrantClient;
+    const calls: AgyOptions[] = [];
+    const c = await connectServer(calls, grants);
+    clients.push(c);
+
     const first = c.callTool({ name: 'antigravity-reply', arguments: { conversation_id: 'conv-9', prompt: 'hold' } });
     while (calls.length === 0) await new Promise((r) => setImmediate(r));
-    const checksBeforeSecond = checkerRequests().length;
+    const checksBeforeSecond = stubCalls.length;
     let ticks = 0;
-    let revoked: () => void = () => {};
-    const ready = new Promise<void>((r) => (revoked = r));
+    let waited: () => void = () => {};
+    const ready = new Promise<void>((r) => (waited = r));
     const second = c.callTool(
       { name: 'antigravity-reply', arguments: { conversation_id: 'conv-9', prompt: 'more' } },
       undefined,
       {
         onprogress: () => {
-          if (++ticks === 3) revoked();
+          if (++ticks === 3) waited();
         },
       },
     );
-    await ready;
+    // a second reply that returns without waiting fails here, not on the test timeout
+    await Promise.race([
+      ready,
+      second.then(() => {
+        throw new Error('the second reply returned before the first turn ended');
+      }),
+    ]);
     // still waiting behind the held turn: no check has run for it yet
-    expect(checkerRequests()).toHaveLength(checksBeforeSecond);
-    setFixture({ decision: wireDecision({ allowed: false, reason: 'revoked' }) });
+    expect(stubCalls).toHaveLength(checksBeforeSecond);
+    revoked = revoke;
     writeFileSync(process.env.FAKE_AGY_RELEASE as string, '');
 
     expect(((await first) as CallToolResult).isError).toBe(false);
-    expect(((await second) as CallToolResult).isError).toBe(true);
-    expect(calls).toHaveLength(1);
+    const queued = (await second) as CallToolResult;
+    expect(stubCalls).toHaveLength(checksBeforeSecond + 1);
+    if (revoke) {
+      expect(queued.isError).toBe(true);
+      expect(JSON.stringify(queued.content)).toContain('(revoked)');
+      expect(calls).toHaveLength(1);
+    } else {
+      expect(queued.isError).toBe(false);
+      expect(calls.map((o) => o.prompt)).toEqual(['hold', 'more']);
+    }
   }
 
   it('revalidates after queue wait', async () => {
-    await seed({ grantId: 'g1', grantRevision: 1 });
-    await revokeWhileQueued(client, agyCalls);
+    await queueBehindHeldTurn(true, false);
+  });
+
+  it('a queued reply runs after the turn ahead of it when nothing changed', async () => {
+    await queueBehindHeldTurn(false, false);
   });
 
   it('revalidates after queue wait on a restarted wrapper', async () => {
-    await seed({ grantId: 'g1', grantRevision: 1 });
-    // a first instance served a reply and went away; a new one reads the same store
-    expect((await call('antigravity-reply', { conversation_id: 'conv-9', prompt: 'one' })).isError).toBe(false);
-    await client.close();
-    const calls: AgyOptions[] = [];
-    const restarted = await connectServer(calls);
-    clients.push(restarted);
-    await revokeWhileQueued(restarted, calls);
+    await queueBehindHeldTurn(true, true);
+  });
+
+  it('a queued reply runs after the turn ahead of it on a restarted wrapper when nothing changed', async () => {
+    await queueBehindHeldTurn(false, true);
   });
 
   it('reply with a looser sandbox than the bound one is refused', async () => {
@@ -481,20 +518,23 @@ describe('antigravity-reply tool', () => {
     expect(agyCalls).toHaveLength(0);
   });
 
-  it('reply with equal or omitted sandbox and permissions proceeds with the bound values', async () => {
-    await seed({ sandbox: true, skipPermissions: false });
+  it.each([
+    { sandbox: true, skip: false },
+    { sandbox: false, skip: true },
+  ])('reply with equal or omitted sandbox and permissions proceeds with the bound values %j', async ({ sandbox, skip }) => {
+    await seed({ sandbox, skipPermissions: skip });
     const equal = await call('antigravity-reply', {
       conversation_id: 'conv-9',
       prompt: 'more',
-      sandbox: true,
-      dangerously_skip_permissions: false,
+      sandbox,
+      dangerously_skip_permissions: skip,
     });
     const omitted = await call('antigravity-reply', { conversation_id: 'conv-9', prompt: 'more' });
 
     for (const result of [equal, omitted]) {
       expect(result.isError).toBe(false);
-      expect(echoedArgv(result)).toContain('--sandbox');
-      expect(echoedArgv(result)).not.toContain('--dangerously-skip-permissions');
+      expect(echoedArgv(result).includes('--sandbox')).toBe(sandbox);
+      expect(echoedArgv(result).includes('--dangerously-skip-permissions')).toBe(skip);
     }
   });
 
