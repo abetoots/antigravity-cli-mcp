@@ -1,4 +1,4 @@
-import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, writeFileSync } from 'node:fs';
+import { existsSync, chmodSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -13,6 +13,7 @@ const FAKE_AGY = resolve(import.meta.dirname, '../test/fake-agy.mjs');
 const FAKE_CHECKER = resolve(import.meta.dirname, '../test/fake-grant-check.mjs');
 
 let client: Client;
+let clients: Client[];
 let dir: string;
 let stateDir: string;
 let project: string;
@@ -80,21 +81,29 @@ beforeEach(async () => {
   setFixture({ decision: wireDecision() });
   process.env.AI_GRANT_CHECK = join(dir, 'grant-check.mjs');
   process.env.ANTIGRAVITY_MCP_STATE_DIR = stateDir;
+  process.env.FAKE_AGY_RELEASE = join(dir, 'release');
   agyCalls = [];
+  client = await connectServer(agyCalls);
+  clients = [client];
+});
+
+// a new wrapper instance over the same binding store, like a restart
+async function connectServer(calls: AgyOptions[]): Promise<Client> {
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   await createServer({
     keepaliveMs: 50,
     runAgy: (opts, hooks) => {
-      agyCalls.push(opts);
+      calls.push(opts);
       return realRunAgy(opts, hooks);
     },
   }).connect(serverTransport);
-  client = new Client({ name: 'test', version: '0.0.0' });
-  await client.connect(clientTransport);
-});
+  const c = new Client({ name: 'test', version: '0.0.0' });
+  await c.connect(clientTransport);
+  return c;
+}
 
 afterEach(async () => {
-  await client.close();
+  await Promise.all(clients.map((c) => c.close()));
 });
 
 async function call(name: string, args: Record<string, unknown>): Promise<CallToolResult> {
@@ -312,20 +321,11 @@ describe('antigravity-reply tool', () => {
     expect(checkerRequests()[0]).toMatchObject({ phase: 'resume', cwd: project, add_dirs: [extra], bound_project: 'p1' });
   });
 
-  it('reply spawns agy in the bound cwd with the bound flags', async () => {
-    await seed({ sandbox: true, skipPermissions: false });
-    const result = await call('antigravity-reply', {
-      conversation_id: 'conv-9',
-      prompt: 'more',
-      sandbox: false,
-      dangerously_skip_permissions: true,
-    });
+  it('reply spawns agy in the bound cwd', async () => {
+    await seed();
+    const echo = echoed(await call('antigravity-reply', { conversation_id: 'conv-9', prompt: 'more' }));
 
-    expect(result.isError).toBe(false);
-    const echo = echoed(result);
     expect(echo.cwd).toBe(project);
-    expect(echo.argv).toContain('--sandbox');
-    expect(echo.argv).not.toContain('--dangerously-skip-permissions');
   });
 
   it('reply after revoke is refused', async () => {
@@ -376,21 +376,24 @@ describe('antigravity-reply tool', () => {
   });
 
   it('refuses when the checker cannot run', async () => {
-    await seed();
+    // an empty bound hash would match a made-up fail-open decision, so only the checker failure can refuse
+    await seed({ effectiveHash: '' });
     process.env.AI_GRANT_CHECK = '/nonexistent/grant-check';
     const result = await call('antigravity-reply', { conversation_id: 'conv-9', prompt: 'more' });
 
     expect(result.isError).toBe(true);
+    expect(JSON.stringify(result.content)).toContain('grant checker could not run');
     expect(agyCalls).toHaveLength(0);
   });
 
   it('never shows checker output in the error', async () => {
-    await seed();
+    await seed({ effectiveHash: '' });
     setFixture({ rawStdout: 'garbage S3CR3T' });
     const result = await call('antigravity-reply', { conversation_id: 'conv-9', prompt: 'more' });
 
     expect(result.isError).toBe(true);
     expect(JSON.stringify(result)).not.toContain('S3CR3T');
+    expect(JSON.stringify(result.content)).toContain('unreadable output');
     expect(agyCalls).toHaveLength(0);
   });
 
@@ -404,23 +407,155 @@ describe('antigravity-reply tool', () => {
     expect(agyCalls).toHaveLength(0);
   });
 
-  it('revalidates after queue wait', async () => {
-    await seed();
-    const first = call('antigravity-reply', { conversation_id: 'conv-9', prompt: 'slow' });
-    // let the first turn reach agy before queueing the second
-    while (agyCalls.length === 0) await new Promise((r) => setTimeout(r, 10));
-    const second = call('antigravity-reply', { conversation_id: 'conv-9', prompt: 'more' });
-    await new Promise((r) => setTimeout(r, 50));
-    // revoked while the second reply waits behind the slow turn
+  // holds the first turn open on the gate, queues a second reply behind it, revokes while it waits
+  // (proved by keepalive ticks, no sleeps), then releases. the recheck must run after the wait
+  async function revokeWhileQueued(c: Client, calls: AgyOptions[]): Promise<void> {
+    const first = c.callTool({ name: 'antigravity-reply', arguments: { conversation_id: 'conv-9', prompt: 'hold' } });
+    while (calls.length === 0) await new Promise((r) => setImmediate(r));
+    const checksBeforeSecond = checkerRequests().length;
+    let ticks = 0;
+    let revoked: () => void = () => {};
+    const ready = new Promise<void>((r) => (revoked = r));
+    const second = c.callTool(
+      { name: 'antigravity-reply', arguments: { conversation_id: 'conv-9', prompt: 'more' } },
+      undefined,
+      {
+        onprogress: () => {
+          if (++ticks === 3) revoked();
+        },
+      },
+    );
+    await ready;
+    // still waiting behind the held turn: no check has run for it yet
+    expect(checkerRequests()).toHaveLength(checksBeforeSecond);
     setFixture({ decision: wireDecision({ allowed: false, reason: 'revoked' }) });
+    writeFileSync(process.env.FAKE_AGY_RELEASE as string, '');
 
-    expect((await first).isError).toBe(false);
-    expect((await second).isError).toBe(true);
-    expect(agyCalls).toHaveLength(1);
+    expect(((await first) as CallToolResult).isError).toBe(false);
+    expect(((await second) as CallToolResult).isError).toBe(true);
+    expect(calls).toHaveLength(1);
+  }
+
+  it('revalidates after queue wait', async () => {
+    await seed({ grantId: 'g1', grantRevision: 1 });
+    await revokeWhileQueued(client, agyCalls);
+  });
+
+  it('revalidates after queue wait on a restarted wrapper', async () => {
+    await seed({ grantId: 'g1', grantRevision: 1 });
+    // a first instance served a reply and went away; a new one reads the same store
+    expect((await call('antigravity-reply', { conversation_id: 'conv-9', prompt: 'one' })).isError).toBe(false);
+    await client.close();
+    const calls: AgyOptions[] = [];
+    const restarted = await connectServer(calls);
+    clients.push(restarted);
+    await revokeWhileQueued(restarted, calls);
+  });
+
+  it('reply with a looser sandbox than the bound one is refused', async () => {
+    await seed({ sandbox: true });
+    const result = await call('antigravity-reply', { conversation_id: 'conv-9', prompt: 'more', sandbox: false });
+
+    expect(result.isError).toBe(true);
+    expect(JSON.stringify(result.content)).toContain('sandbox');
+    expect(agyCalls).toHaveLength(0);
+  });
+
+  it('reply with a tighter sandbox than the bound one is refused', async () => {
+    await seed({ sandbox: false });
+    const result = await call('antigravity-reply', { conversation_id: 'conv-9', prompt: 'more', sandbox: true });
+
+    expect(result.isError).toBe(true);
+    expect(agyCalls).toHaveLength(0);
+  });
+
+  it('reply with looser or tighter dangerously_skip_permissions is refused', async () => {
+    await seed({ skipPermissions: false });
+    const looser = await call('antigravity-reply', { conversation_id: 'conv-9', prompt: 'more', dangerously_skip_permissions: true });
+    await seed({ skipPermissions: true });
+    const tighter = await call('antigravity-reply', { conversation_id: 'conv-9', prompt: 'more', dangerously_skip_permissions: false });
+
+    expect(looser.isError).toBe(true);
+    expect(JSON.stringify(looser.content)).toContain('dangerously_skip_permissions');
+    expect(tighter.isError).toBe(true);
+    expect(agyCalls).toHaveLength(0);
+  });
+
+  it('reply with equal or omitted sandbox and permissions proceeds with the bound values', async () => {
+    await seed({ sandbox: true, skipPermissions: false });
+    const equal = await call('antigravity-reply', {
+      conversation_id: 'conv-9',
+      prompt: 'more',
+      sandbox: true,
+      dangerously_skip_permissions: false,
+    });
+    const omitted = await call('antigravity-reply', { conversation_id: 'conv-9', prompt: 'more' });
+
+    for (const result of [equal, omitted]) {
+      expect(result.isError).toBe(false);
+      expect(echoedArgv(result)).toContain('--sandbox');
+      expect(echoedArgv(result)).not.toContain('--dangerously-skip-permissions');
+    }
+  });
+
+  it('reply resolves a relative add_dir against the bound cwd', async () => {
+    const extra = join(dir, 'extra');
+    mkdirSync(extra);
+    await seed({ addDirs: [extra] });
+    const result = await call('antigravity-reply', { conversation_id: 'conv-9', prompt: 'more', add_dirs: ['../extra'] });
+
+    expect(result.isError).toBe(false);
+    expect(echoedArgv(result)).toEqual(expect.arrayContaining(['--add-dir', extra]));
+  });
+
+  it('reply with a relative add_dir that resolves elsewhere is refused', async () => {
+    const extra = join(dir, 'extra');
+    mkdirSync(extra);
+    await seed({ addDirs: [extra] });
+    const result = await call('antigravity-reply', { conversation_id: 'conv-9', prompt: 'more', add_dirs: ['extra'] });
+
+    expect(result.isError).toBe(true);
+    expect(agyCalls).toHaveLength(0);
   });
 });
 
 describe('antigravity start binding', () => {
+  it.each([
+    ['cannot run', () => { process.env.AI_GRANT_CHECK = join(dir, 'missing-checker'); }, 'could not run'],
+    ['exits 3', () => setFixture({ exit: 3 }), 'exited 3'],
+    ['prints garbage S3CR3T', () => setFixture({ rawStdout: 'garbage S3CR3T' }), 'unreadable output'],
+    ['prints a decision missing fields', () => setFixture({ rawStdout: JSON.stringify({ allowed: true, reason: 'x' }) }), 'unreadable output'],
+  ])('start is refused, with no spawn and no binding, when the checker %s', async (_name, arrange, why) => {
+    arrange();
+    const result = await call('antigravity', { prompt: 'hi', cwd: project });
+
+    expect(result.isError).toBe(true);
+    expect(JSON.stringify(result.content)).toContain(why);
+    expect(JSON.stringify(result)).not.toContain('S3CR3T');
+    expect(agyCalls).toHaveLength(0);
+    expect(existsSync(stateDir)).toBe(false);
+  });
+
+
+  it('a relative add_dir resolves against the call cwd, not the launch directory', async () => {
+    mkdirSync(join(project, 'sub'));
+    const result = await call('antigravity', { prompt: 'hi', cwd: project, add_dirs: ['sub'] });
+
+    expect(result.isError).toBe(false);
+    expect(checkerRequests()[0]).toMatchObject({ cwd: project, add_dirs: [join(project, 'sub')] });
+    expect(echoedArgv(result)).toEqual(expect.arrayContaining(['--add-dir', join(project, 'sub')]));
+    expect((await loadBinding('conv-123', stateDir))?.addDirs).toEqual([join(project, 'sub')]);
+  });
+
+  it('a relative add_dir that escapes the project is checked as the absolute outside path and refused', async () => {
+    setFixture({ decision: wireDecision({ allowed: false, reason: 'outside-roots' }) });
+    const result = await call('antigravity', { prompt: 'hi', cwd: project, add_dirs: ['../outside'] });
+
+    expect(result.isError).toBe(true);
+    expect(agyCalls).toHaveLength(0);
+    expect(checkerRequests()[0]).toMatchObject({ add_dirs: [join(dir, 'outside')] });
+  });
+
   it('a project cwd with an add_dir outside the project is refused', async () => {
     setFixture({ decision: wireDecision({ allowed: false, reason: 'outside-roots' }) });
     const result = await call('antigravity', { prompt: 'hi', cwd: project, add_dirs: ['/elsewhere'] });
