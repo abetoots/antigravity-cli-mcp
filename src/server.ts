@@ -38,30 +38,41 @@ const sharedInput = {
     .string()
     .optional()
     .describe('Working directory for the agent. Defaults to the directory this MCP server was launched from.'),
-  add_dirs: z.array(z.string()).optional().describe('Extra directories to add to the agent workspace.'),
+  add_dirs: z.array(z.string()).optional().describe('Extra directories to add to the agent workspace. Relative paths resolve against `cwd`.'),
   // "plan" is deliberately not offered: headless plan mode blocks commands and url reads even
   // with permissions skipped, so reviewers picking it as "read-only" got empty responses
   mode: z
     .enum(['accept-edits'])
     .optional()
     .describe('Agent execution mode. Omit to use the CLI default.'),
-  sandbox: z.boolean().optional().describe('Run with terminal restrictions enabled.'),
+};
+
+const startOnlyInput = {
+  sandbox: z.boolean().optional().describe('Run with terminal restrictions enabled. Fixed for the conversation when it starts.'),
   dangerously_skip_permissions: z
     .boolean()
     .default(true)
     .describe(
       'Auto-approve every tool permission (default true), so the agent can run commands and read files. ' +
         'Set false to follow the CLI permission settings instead; headless runs then auto-deny anything ' +
-        'not allowed there (reported in denied_actions). Combine with sandbox for terminal restrictions.',
+        'not allowed there (reported in denied_actions). Combine with sandbox for terminal restrictions. ' +
+        'Fixed for the conversation when it starts.',
     ),
-};
-
-const startOnlyInput = {
   grant: z
     .string()
     .min(1)
     .optional()
     .describe('Optional session grant id issued by the hub (bin/grant). Binds the conversation to the grant\'s project, task and expiry.'),
+};
+
+// reply cannot change what the conversation was started with: a differing value is refused,
+// an equal or omitted one uses the bound value
+const replyOnlyInput = {
+  sandbox: z.boolean().optional().describe('Must equal the value the conversation started with, or be omitted; a different value is refused.'),
+  dangerously_skip_permissions: z
+    .boolean()
+    .optional()
+    .describe('Must equal the value the conversation started with, or be omitted; a different value is refused.'),
 };
 
 const outputSchema = {
@@ -144,11 +155,12 @@ function describeStep(step: StepUpdate): string | undefined {
 }
 
 // the real path when the directory exists, else the plain absolute path
-function resolvePath(p: string): string {
+function resolvePath(p: string, base?: string): string {
+  const abs = base === undefined ? resolve(p) : resolve(base, p);
   try {
-    return realpathSync(p);
+    return realpathSync(abs);
   } catch {
-    return resolve(p);
+    return abs;
   }
 }
 
@@ -241,7 +253,7 @@ export function createServer({ keepaliveMs = KEEPALIVE_MS, runAgy = defaultRunAg
 
   const start = async (args: SharedArgs & { grant?: string }): Promise<Prepared> => {
     const cwd = resolvePath(args.cwd ?? process.cwd());
-    const addDirs = (args.add_dirs ?? []).map(resolvePath);
+    const addDirs = (args.add_dirs ?? []).map((d) => resolvePath(d, cwd));
     const sandbox = args.sandbox === true;
     const skipPermissions = args.dangerously_skip_permissions ?? true;
     const decision = await checkGrant({
@@ -300,8 +312,16 @@ export function createServer({ keepaliveMs = KEEPALIVE_MS, runAgy = defaultRunAg
     if (args.cwd !== undefined && resolvePath(args.cwd) !== bound.cwd) {
       return refusal('refused: cwd differs from the directory the conversation was started in.');
     }
-    if (args.add_dirs !== undefined && !sameSet(args.add_dirs.map(resolvePath), bound.addDirs)) {
+    if (args.add_dirs !== undefined && !sameSet(args.add_dirs.map((d) => resolvePath(d, bound.cwd)), bound.addDirs)) {
       return refusal('refused: add_dirs differ from the directories the conversation was started with.');
+    }
+    if (args.sandbox !== undefined && args.sandbox !== bound.sandbox) {
+      return refusal('refused: sandbox differs from the value the conversation was started with; start a new conversation to change it.');
+    }
+    if (args.dangerously_skip_permissions !== undefined && args.dangerously_skip_permissions !== bound.skipPermissions) {
+      return refusal(
+        'refused: dangerously_skip_permissions differs from the value the conversation was started with; start a new conversation to change it.',
+      );
     }
     const decision = await checkGrant({
       phase: 'resume',
@@ -349,8 +369,15 @@ export function createServer({ keepaliveMs = KEEPALIVE_MS, runAgy = defaultRunAg
     {
       title: 'Continue Antigravity conversation',
       description:
-        'Send a follow-up prompt to an existing Antigravity conversation, using the conversation_id returned by antigravity.',
-      inputSchema: { conversation_id: z.string().min(1).describe('conversation_id from a previous call.'), ...sharedInput },
+        'Send a follow-up prompt to an existing Antigravity conversation, using the conversation_id returned by antigravity. ' +
+        'The conversation keeps the cwd, add_dirs, sandbox and dangerously_skip_permissions it started with: ' +
+        'a different value for any of them is refused (relative add_dirs resolve against the conversation\'s cwd); ' +
+        'start a new conversation to change them.',
+      inputSchema: {
+        conversation_id: z.string().min(1).describe('conversation_id from a previous call.'),
+        ...sharedInput,
+        ...replyOnlyInput,
+      },
       outputSchema,
       annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
     },

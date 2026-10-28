@@ -6,7 +6,7 @@ It is a thin wrapper: **model, reasoning effort and time limit come from the CLI
 unless a call overrides them.** Nothing is pinned by the server. The exception is permissions, which are
 auto-approved by default because headless runs can't prompt and reviewers need to run commands.
 
-| Setting | Default when not passed | Override |
+| Setting | Default when not passed | Override (on start) |
 |---|---|---|
 | Model | `"model"` in `~/.gemini/antigravity-cli/settings.json` (what `/model` sets) | `model` |
 | Effort | the selected model's default | `effort` (`low`…`max`, validated by the CLI per model) |
@@ -16,7 +16,10 @@ auto-approved by default because headless runs can't prompt and reviewers need t
 ## Tools
 
 - `antigravity`: start a session. Params: `prompt` plus optional `model`, `effort`, `timeout`, `cwd`, `add_dirs`, `mode`, `sandbox`, `dangerously_skip_permissions`.
-- `antigravity-reply`: continue a session by `conversation_id`, with the same optional overrides.
+- `antigravity-reply`: continue a session by `conversation_id`, with optional `prompt`-side overrides `model`, `effort`, `timeout` and `mode`.
+  `cwd`, `add_dirs`, `sandbox` and `dangerously_skip_permissions` are fixed when the conversation starts: a reply that passes a
+  different value is refused (nothing is spawned), an equal or omitted value uses the bound one. Relative `add_dirs` resolve against
+  the conversation's `cwd`. To change them, start a new conversation.
 
 `mode` only offers `accept-edits`. Plan mode is left out on purpose: headless, it blocks running commands and
 reading URLs even with permissions skipped, so the agent returns an empty response.
