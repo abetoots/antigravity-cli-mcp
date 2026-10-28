@@ -37,6 +37,10 @@ if (prompt === 'slow') {
   result({ response: 'partial' });
 } else if (prompt === 'fail') {
   result({ conversation_id: '', status: 'ERROR', error: 'invalid model selection', num_turns: 0 });
+} else if (prompt === 'noid') {
+  result({ conversation_id: '', response: 'ok' });
+} else if (prompt === 'denied-camel') {
+  result({ deniedActions: ['RunCommand', { action: 'read', displayName: 'ReadFile' }] });
 } else if (prompt === 'denied') {
   result({ denied_actions: [{ action: 'command', display_name: 'RunCommand' }] });
 } else {

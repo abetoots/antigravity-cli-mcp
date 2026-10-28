@@ -1,8 +1,12 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { RequestHandlerExtra } from '@modelcontextprotocol/sdk/shared/protocol.js';
 import type { CallToolResult, ServerNotification, ServerRequest } from '@modelcontextprotocol/sdk/types.js';
+import { realpathSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { z } from 'zod';
-import { runAgy, type AgyOptions, type AgyResult, type StepUpdate } from './agy.js';
+import { runAgy as defaultRunAgy, type AgyOptions, type AgyResult, type StepUpdate } from './agy.js';
+import { BindingUnreadable, loadBinding, saveBinding } from './conversation-binding.js';
+import { GrantClient, defaultCheckerPath, type GrantDecision } from './grant-client.js';
 
 type ToolExtra = RequestHandlerExtra<ServerRequest, ServerNotification>;
 
@@ -50,6 +54,14 @@ const sharedInput = {
         'Set false to follow the CLI permission settings instead; headless runs then auto-deny anything ' +
         'not allowed there (reported in denied_actions). Combine with sandbox for terminal restrictions.',
     ),
+};
+
+const startOnlyInput = {
+  grant: z
+    .string()
+    .min(1)
+    .optional()
+    .describe('Optional session grant id issued by the hub (bin/grant). Binds the conversation to the grant\'s project, task and expiry.'),
 };
 
 const outputSchema = {
@@ -131,10 +143,64 @@ function describeStep(step: StepUpdate): string | undefined {
   return undefined;
 }
 
-export function createServer({ keepaliveMs = KEEPALIVE_MS }: { keepaliveMs?: number } = {}): McpServer {
-  const server = new McpServer({ name: 'antigravity', version: '0.1.0' });
+// the real path when the directory exists, else the plain absolute path
+function resolvePath(p: string): string {
+  try {
+    return realpathSync(p);
+  } catch {
+    return resolve(p);
+  }
+}
 
-  const run = async (opts: AgyOptions, extra: ToolExtra): Promise<CallToolResult> => {
+const sameSet = (a: string[], b: string[]): boolean => {
+  const x = [...a].sort();
+  const y = [...b].sort();
+  return x.length === y.length && x.every((v, i) => v === y[i]);
+};
+
+const refusal = (text: string): CallToolResult => ({ content: [{ type: 'text', text }], isError: true });
+
+// what the handler decided before spawning agy: either a refusal, or the options to run with and
+// what to do with the result
+type Prepared = CallToolResult | { opts: AgyOptions; finish: (result: AgyResult) => Promise<CallToolResult> };
+
+export interface ServerDeps {
+  keepaliveMs?: number;
+  runAgy?: typeof defaultRunAgy;
+  grants?: GrantClient;
+}
+
+export function createServer({ keepaliveMs = KEEPALIVE_MS, runAgy = defaultRunAgy, grants }: ServerDeps = {}): McpServer {
+  const server = new McpServer({ name: 'antigravity', version: '0.1.0' });
+  // the checker path is read per call, like AGY_BIN
+  const checker = (): GrantClient => grants ?? new GrantClient(defaultCheckerPath());
+
+  // one promise chain per conversation: a reply waits for the one before it, and everything it
+  // checks is checked after that wait
+  const chains = new Map<string, Promise<unknown>>();
+  const enqueue = <T>(id: string, task: () => Promise<T>): Promise<T> => {
+    const next = (chains.get(id) ?? Promise.resolve()).then(task, task);
+    const tail = next.catch(() => undefined);
+    chains.set(id, tail);
+    void tail.then(() => {
+      if (chains.get(id) === tail) chains.delete(id);
+    });
+    return next;
+  };
+
+  const checkGrant = async (req: Parameters<GrantClient['check']>[0]): Promise<GrantDecision | CallToolResult> => {
+    try {
+      const decision = await checker().check(req);
+      return decision.allowed
+        ? decision
+        : refusal(`refused by the grant check (${decision.reason}). Nothing was sent to Antigravity.`);
+    } catch (err) {
+      // the client's messages never carry checker output
+      return refusal(`refused: ${(err as Error).message}. Nothing was sent to Antigravity.`);
+    }
+  };
+
+  const run = async (extra: ToolExtra, prepare: () => Promise<Prepared>, chainKey?: string): Promise<CallToolResult> => {
     const progressToken = extra._meta?.progressToken;
     let progress = 0;
     let lastMessage = 'working';
@@ -150,8 +216,10 @@ export function createServer({ keepaliveMs = KEEPALIVE_MS }: { keepaliveMs?: num
     // keepalive so a long silent step doesn't trip the client's idle timeout
     // (claude code aborts stdio tool calls after 30 min without a response or progress)
     const keepalive = progressToken === undefined ? undefined : setInterval(() => notify(lastMessage), keepaliveMs);
-    try {
-      const result = await runAgy(opts, {
+    const go = async (): Promise<CallToolResult> => {
+      const prepared = await prepare();
+      if ('content' in prepared) return prepared;
+      const result = await runAgy(prepared.opts, {
         signal: extra.signal,
         onStep: (step) => {
           const message = describeStep(step);
@@ -160,12 +228,105 @@ export function createServer({ keepaliveMs = KEEPALIVE_MS }: { keepaliveMs?: num
           notify(message);
         },
       });
-      return formatResult(result);
+      return prepared.finish(result);
+    };
+    try {
+      return await (chainKey === undefined ? go() : enqueue(chainKey, go));
     } catch (err) {
       return { content: [{ type: 'text', text: (err as Error).message }], isError: true };
     } finally {
       clearInterval(keepalive);
     }
+  };
+
+  const start = async (args: SharedArgs & { grant?: string }): Promise<Prepared> => {
+    const cwd = resolvePath(args.cwd ?? process.cwd());
+    const addDirs = (args.add_dirs ?? []).map(resolvePath);
+    const sandbox = args.sandbox === true;
+    const skipPermissions = args.dangerously_skip_permissions ?? true;
+    const decision = await checkGrant({
+      phase: 'start',
+      harness: 'gemini',
+      cwd,
+      addDirs,
+      grantId: args.grant ?? null,
+      revision: null,
+      boundProject: null,
+    });
+    if ('content' in decision) return decision;
+    return {
+      opts: { ...toAgyOptions(args), cwd, addDirs, sandbox, dangerouslySkipPermissions: skipPermissions },
+      finish: async (result) => {
+        if (!result.conversation_id) {
+          // nothing to bind: a failed run is reported as such, a successful one cannot be continued safely
+          if (result.status !== 'SUCCESS') return formatResult(result);
+          return refusal('Antigravity returned no conversation_id, so the conversation cannot be bound to its project.');
+        }
+        try {
+          await saveBinding({
+            schema: 1,
+            conversationId: result.conversation_id,
+            cwd,
+            addDirs,
+            project: decision.project,
+            grantId: args.grant ?? null,
+            grantRevision: decision.grantRevision,
+            expiresAt: decision.expiresAt,
+            effectiveHash: decision.effectiveHash,
+            sandbox,
+            skipPermissions,
+            createdAt: new Date().toISOString(),
+          });
+        } catch {
+          return refusal('could not save the conversation binding; the conversation_id was not released.');
+        }
+        return formatResult(result);
+      },
+    };
+  };
+
+  // runs inside the conversation's chain, after any queue wait, right before agy is spawned
+  const reply = async (conversationId: string, args: SharedArgs): Promise<Prepared> => {
+    let bound;
+    try {
+      bound = await loadBinding(conversationId);
+    } catch (err) {
+      if (err instanceof BindingUnreadable) return refusal(`refused: ${err.message}.`);
+      return refusal('refused: the conversation binding could not be read.');
+    }
+    if (!bound) {
+      return refusal('refused: no binding for this conversation (it was not started through this wrapper, or its state was lost).');
+    }
+    if (args.cwd !== undefined && resolvePath(args.cwd) !== bound.cwd) {
+      return refusal('refused: cwd differs from the directory the conversation was started in.');
+    }
+    if (args.add_dirs !== undefined && !sameSet(args.add_dirs.map(resolvePath), bound.addDirs)) {
+      return refusal('refused: add_dirs differ from the directories the conversation was started with.');
+    }
+    const decision = await checkGrant({
+      phase: 'resume',
+      harness: 'gemini',
+      cwd: bound.cwd,
+      addDirs: bound.addDirs,
+      grantId: bound.grantId,
+      revision: bound.grantRevision,
+      boundProject: bound.project,
+    });
+    if ('content' in decision) return decision;
+    if (decision.effectiveHash !== bound.effectiveHash) {
+      return refusal('refused: the project\'s standing scope changed since this conversation started; start a new one.');
+    }
+    return {
+      // the bound settings win over anything the caller passed
+      opts: {
+        ...toAgyOptions(args, conversationId),
+        cwd: bound.cwd,
+        addDirs: bound.addDirs,
+        sandbox: bound.sandbox,
+        dangerouslySkipPermissions: bound.skipPermissions,
+      },
+      finish: async (result) => formatResult(result),
+    };
   };
 
   server.registerTool(
@@ -176,11 +337,11 @@ export function createServer({ keepaliveMs = KEEPALIVE_MS }: { keepaliveMs?: num
         'Start a new Google Antigravity (agy) agent session in headless mode and return its final response. ' +
         'Model, reasoning effort and time limit come from the Antigravity CLI configuration unless overridden. ' +
         'Returns a conversation_id that can be continued with antigravity-reply.',
-      inputSchema: sharedInput,
+      inputSchema: { ...sharedInput, ...startOnlyInput },
       outputSchema,
       annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
     },
-    (args, extra) => run(toAgyOptions(args), extra),
+    (args, extra) => run(extra, () => start(args)),
   );
 
   server.registerTool(
@@ -193,7 +354,7 @@ export function createServer({ keepaliveMs = KEEPALIVE_MS }: { keepaliveMs?: num
       outputSchema,
       annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
     },
-    ({ conversation_id, ...args }, extra) => run(toAgyOptions(args, conversation_id), extra),
+    ({ conversation_id, ...args }, extra) => run(extra, () => reply(conversation_id, args), conversation_id),
   );
 
   return server;
