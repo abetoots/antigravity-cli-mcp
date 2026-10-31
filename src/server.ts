@@ -1,8 +1,12 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { RequestHandlerExtra } from '@modelcontextprotocol/sdk/shared/protocol.js';
 import type { CallToolResult, ServerNotification, ServerRequest } from '@modelcontextprotocol/sdk/types.js';
+import { realpathSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { z } from 'zod';
-import { runAgy, type AgyOptions, type AgyResult, type StepUpdate } from './agy.js';
+import { runAgy as defaultRunAgy, type AgyOptions, type AgyResult, type StepUpdate } from './agy.js';
+import { BindingUnreadable, loadBinding, saveBinding } from './conversation-binding.js';
+import { GrantClient, defaultCheckerPath, type GrantDecision } from './grant-client.js';
 
 type ToolExtra = RequestHandlerExtra<ServerRequest, ServerNotification>;
 
@@ -34,22 +38,41 @@ const sharedInput = {
     .string()
     .optional()
     .describe('Working directory for the agent. Defaults to the directory this MCP server was launched from.'),
-  add_dirs: z.array(z.string()).optional().describe('Extra directories to add to the agent workspace.'),
+  add_dirs: z.array(z.string()).optional().describe('Extra directories to add to the agent workspace. Relative paths resolve against `cwd`.'),
   // "plan" is deliberately not offered: headless plan mode blocks commands and url reads even
   // with permissions skipped, so reviewers picking it as "read-only" got empty responses
   mode: z
     .enum(['accept-edits'])
     .optional()
     .describe('Agent execution mode. Omit to use the CLI default.'),
-  sandbox: z.boolean().optional().describe('Run with terminal restrictions enabled.'),
+};
+
+const startOnlyInput = {
+  sandbox: z.boolean().optional().describe('Run with terminal restrictions enabled. Fixed for the conversation when it starts.'),
   dangerously_skip_permissions: z
     .boolean()
     .default(true)
     .describe(
       'Auto-approve every tool permission (default true), so the agent can run commands and read files. ' +
         'Set false to follow the CLI permission settings instead; headless runs then auto-deny anything ' +
-        'not allowed there (reported in denied_actions). Combine with sandbox for terminal restrictions.',
+        'not allowed there (reported in denied_actions). Combine with sandbox for terminal restrictions. ' +
+        'Fixed for the conversation when it starts.',
     ),
+  grant: z
+    .string()
+    .min(1)
+    .optional()
+    .describe('Optional session grant id issued by the hub (bin/grant). Binds the conversation to the grant\'s project, task and expiry.'),
+};
+
+// reply cannot change what the conversation was started with: a differing value is refused,
+// an equal or omitted one uses the bound value
+const replyOnlyInput = {
+  sandbox: z.boolean().optional().describe('Must equal the value the conversation started with, or be omitted; a different value is refused.'),
+  dangerously_skip_permissions: z
+    .boolean()
+    .optional()
+    .describe('Must equal the value the conversation started with, or be omitted; a different value is refused.'),
 };
 
 const outputSchema = {
@@ -131,10 +154,65 @@ function describeStep(step: StepUpdate): string | undefined {
   return undefined;
 }
 
-export function createServer({ keepaliveMs = KEEPALIVE_MS }: { keepaliveMs?: number } = {}): McpServer {
-  const server = new McpServer({ name: 'antigravity', version: '0.1.0' });
+// the real path when the directory exists, else the plain absolute path
+function resolvePath(p: string, base?: string): string {
+  const abs = base === undefined ? resolve(p) : resolve(base, p);
+  try {
+    return realpathSync(abs);
+  } catch {
+    return abs;
+  }
+}
 
-  const run = async (opts: AgyOptions, extra: ToolExtra): Promise<CallToolResult> => {
+const sameSet = (a: string[], b: string[]): boolean => {
+  const x = [...a].sort();
+  const y = [...b].sort();
+  return x.length === y.length && x.every((v, i) => v === y[i]);
+};
+
+const refusal = (text: string): CallToolResult => ({ content: [{ type: 'text', text }], isError: true });
+
+// what the handler decided before spawning agy: either a refusal, or the options to run with and
+// what to do with the result
+type Prepared = CallToolResult | { opts: AgyOptions; finish: (result: AgyResult) => Promise<CallToolResult> };
+
+export interface ServerDeps {
+  keepaliveMs?: number;
+  runAgy?: typeof defaultRunAgy;
+  grants?: GrantClient;
+}
+
+export function createServer({ keepaliveMs = KEEPALIVE_MS, runAgy = defaultRunAgy, grants }: ServerDeps = {}): McpServer {
+  const server = new McpServer({ name: 'antigravity', version: '0.1.0' });
+  // the checker path is read per call, like AGY_BIN
+  const checker = (): GrantClient => grants ?? new GrantClient(defaultCheckerPath());
+
+  // one promise chain per conversation: a reply waits for the one before it, and everything it
+  // checks is checked after that wait
+  const chains = new Map<string, Promise<unknown>>();
+  const enqueue = <T>(id: string, task: () => Promise<T>): Promise<T> => {
+    const next = (chains.get(id) ?? Promise.resolve()).then(task, task);
+    const tail = next.catch(() => undefined);
+    chains.set(id, tail);
+    void tail.then(() => {
+      if (chains.get(id) === tail) chains.delete(id);
+    });
+    return next;
+  };
+
+  const checkGrant = async (req: Parameters<GrantClient['check']>[0]): Promise<GrantDecision | CallToolResult> => {
+    try {
+      const decision = await checker().check(req);
+      return decision.allowed
+        ? decision
+        : refusal(`refused by the grant check (${decision.reason}). Nothing was sent to Antigravity.`);
+    } catch (err) {
+      // the client's messages never carry checker output
+      return refusal(`refused: ${(err as Error).message}. Nothing was sent to Antigravity.`);
+    }
+  };
+
+  const run = async (extra: ToolExtra, prepare: () => Promise<Prepared>, chainKey?: string): Promise<CallToolResult> => {
     const progressToken = extra._meta?.progressToken;
     let progress = 0;
     let lastMessage = 'working';
@@ -150,8 +228,10 @@ export function createServer({ keepaliveMs = KEEPALIVE_MS }: { keepaliveMs?: num
     // keepalive so a long silent step doesn't trip the client's idle timeout
     // (claude code aborts stdio tool calls after 30 min without a response or progress)
     const keepalive = progressToken === undefined ? undefined : setInterval(() => notify(lastMessage), keepaliveMs);
-    try {
-      const result = await runAgy(opts, {
+    const go = async (): Promise<CallToolResult> => {
+      const prepared = await prepare();
+      if ('content' in prepared) return prepared;
+      const result = await runAgy(prepared.opts, {
         signal: extra.signal,
         onStep: (step) => {
           const message = describeStep(step);
@@ -160,12 +240,113 @@ export function createServer({ keepaliveMs = KEEPALIVE_MS }: { keepaliveMs?: num
           notify(message);
         },
       });
-      return formatResult(result);
+      return prepared.finish(result);
+    };
+    try {
+      return await (chainKey === undefined ? go() : enqueue(chainKey, go));
     } catch (err) {
       return { content: [{ type: 'text', text: (err as Error).message }], isError: true };
     } finally {
       clearInterval(keepalive);
     }
+  };
+
+  const start = async (args: SharedArgs & { grant?: string }): Promise<Prepared> => {
+    const cwd = resolvePath(args.cwd ?? process.cwd());
+    const addDirs = (args.add_dirs ?? []).map((d) => resolvePath(d, cwd));
+    const sandbox = args.sandbox === true;
+    const skipPermissions = args.dangerously_skip_permissions ?? true;
+    const decision = await checkGrant({
+      phase: 'start',
+      harness: 'gemini',
+      cwd,
+      addDirs,
+      grantId: args.grant ?? null,
+      revision: null,
+      boundProject: null,
+    });
+    if ('content' in decision) return decision;
+    return {
+      opts: { ...toAgyOptions(args), cwd, addDirs, sandbox, dangerouslySkipPermissions: skipPermissions },
+      finish: async (result) => {
+        if (!result.conversation_id) {
+          // nothing to bind: a failed run is reported as such, a successful one cannot be continued safely
+          if (result.status !== 'SUCCESS') return formatResult(result);
+          return refusal('Antigravity returned no conversation_id, so the conversation cannot be bound to its project.');
+        }
+        try {
+          await saveBinding({
+            schema: 1,
+            conversationId: result.conversation_id,
+            cwd,
+            addDirs,
+            project: decision.project,
+            grantId: args.grant ?? null,
+            grantRevision: decision.grantRevision,
+            expiresAt: decision.expiresAt,
+            effectiveHash: decision.effectiveHash,
+            sandbox,
+            skipPermissions,
+            createdAt: new Date().toISOString(),
+          });
+        } catch {
+          return refusal('could not save the conversation binding; the conversation_id was not released.');
+        }
+        return formatResult(result);
+      },
+    };
+  };
+
+  // runs inside the conversation's chain, after any queue wait, right before agy is spawned
+  const reply = async (conversationId: string, args: SharedArgs): Promise<Prepared> => {
+    let bound;
+    try {
+      bound = await loadBinding(conversationId);
+    } catch (err) {
+      if (err instanceof BindingUnreadable) return refusal(`refused: ${err.message}.`);
+      return refusal('refused: the conversation binding could not be read.');
+    }
+    if (!bound) {
+      return refusal('refused: no binding for this conversation (it was not started through this wrapper, or its state was lost).');
+    }
+    if (args.cwd !== undefined && resolvePath(args.cwd) !== bound.cwd) {
+      return refusal('refused: cwd differs from the directory the conversation was started in.');
+    }
+    if (args.add_dirs !== undefined && !sameSet(args.add_dirs.map((d) => resolvePath(d, bound.cwd)), bound.addDirs)) {
+      return refusal('refused: add_dirs differ from the directories the conversation was started with.');
+    }
+    if (args.sandbox !== undefined && args.sandbox !== bound.sandbox) {
+      return refusal('refused: sandbox differs from the value the conversation was started with; start a new conversation to change it.');
+    }
+    if (args.dangerously_skip_permissions !== undefined && args.dangerously_skip_permissions !== bound.skipPermissions) {
+      return refusal(
+        'refused: dangerously_skip_permissions differs from the value the conversation was started with; start a new conversation to change it.',
+      );
+    }
+    const decision = await checkGrant({
+      phase: 'resume',
+      harness: 'gemini',
+      cwd: bound.cwd,
+      addDirs: bound.addDirs,
+      grantId: bound.grantId,
+      revision: bound.grantRevision,
+      boundProject: bound.project,
+    });
+    if ('content' in decision) return decision;
+    if (decision.effectiveHash !== bound.effectiveHash) {
+      return refusal('refused: the project\'s standing scope changed since this conversation started; start a new one.');
+    }
+    return {
+      // the bound settings win over anything the caller passed
+      opts: {
+        ...toAgyOptions(args, conversationId),
+        cwd: bound.cwd,
+        addDirs: bound.addDirs,
+        sandbox: bound.sandbox,
+        dangerouslySkipPermissions: bound.skipPermissions,
+      },
+      finish: async (result) => formatResult(result),
+    };
   };
 
   server.registerTool(
@@ -176,11 +357,11 @@ export function createServer({ keepaliveMs = KEEPALIVE_MS }: { keepaliveMs?: num
         'Start a new Google Antigravity (agy) agent session in headless mode and return its final response. ' +
         'Model, reasoning effort and time limit come from the Antigravity CLI configuration unless overridden. ' +
         'Returns a conversation_id that can be continued with antigravity-reply.',
-      inputSchema: sharedInput,
+      inputSchema: { ...sharedInput, ...startOnlyInput },
       outputSchema,
       annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
     },
-    (args, extra) => run(toAgyOptions(args), extra),
+    (args, extra) => run(extra, () => start(args)),
   );
 
   server.registerTool(
@@ -188,12 +369,19 @@ export function createServer({ keepaliveMs = KEEPALIVE_MS }: { keepaliveMs?: num
     {
       title: 'Continue Antigravity conversation',
       description:
-        'Send a follow-up prompt to an existing Antigravity conversation, using the conversation_id returned by antigravity.',
-      inputSchema: { conversation_id: z.string().min(1).describe('conversation_id from a previous call.'), ...sharedInput },
+        'Send a follow-up prompt to an existing Antigravity conversation, using the conversation_id returned by antigravity. ' +
+        'The conversation keeps the cwd, add_dirs, sandbox and dangerously_skip_permissions it started with: ' +
+        'a different value for any of them is refused (relative add_dirs resolve against the conversation\'s cwd); ' +
+        'start a new conversation to change them.',
+      inputSchema: {
+        conversation_id: z.string().min(1).describe('conversation_id from a previous call.'),
+        ...sharedInput,
+        ...replyOnlyInput,
+      },
       outputSchema,
       annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
     },
-    ({ conversation_id, ...args }, extra) => run(toAgyOptions(args, conversation_id), extra),
+    ({ conversation_id, ...args }, extra) => run(extra, () => reply(conversation_id, args), conversation_id),
   );
 
   return server;

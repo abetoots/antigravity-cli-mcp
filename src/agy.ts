@@ -46,6 +46,25 @@ export interface AgyResult {
   timed_out_after?: string;
 }
 
+// the cli has spelled denied actions as `denied_actions` objects, a `deniedActions` key, and bare
+// strings; callers only ever see the first shape
+export function normalizeDenied(raw: Record<string, unknown>): { action: string; display_name: string }[] | undefined {
+  const list = raw.denied_actions ?? raw.deniedActions;
+  if (!Array.isArray(list)) return undefined;
+  const out: { action: string; display_name: string }[] = [];
+  for (const item of list) {
+    if (typeof item === 'string') out.push({ action: item, display_name: item });
+    else if (typeof item === 'object' && item !== null) {
+      const o = item as Record<string, unknown>;
+      const action = typeof o.action === 'string' ? o.action : '';
+      const name = o.display_name ?? o.displayName;
+      const display = typeof name === 'string' ? name : action;
+      if (action || display) out.push({ action: action || display, display_name: display });
+    }
+  }
+  return out;
+}
+
 export interface StepUpdate {
   conversation_id?: string;
   step_index?: number;
@@ -116,7 +135,11 @@ export function runAgy(opts: AgyOptions, hooks: RunHooks = {}): Promise<AgyResul
         // non-json noise on stdout is ignored; stderr carries diagnostics
         return;
       }
-      if (event.event === 'result' && event.result) result = event.result;
+      if (event.event === 'result' && event.result) {
+        const { deniedActions: _camel, ...rest } = event.result as AgyResult & { deniedActions?: unknown };
+        const denied = normalizeDenied(event.result as unknown as Record<string, unknown>);
+        result = denied ? { ...rest, denied_actions: denied } : rest;
+      }
       else if (event.event === 'step_update' && event.step_update) hooks.onStep?.(event.step_update);
     });
 

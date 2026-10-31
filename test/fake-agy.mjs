@@ -28,7 +28,12 @@ emit({ event: 'init', conversation_id: id, init: { cwd: process.cwd(), tools: []
 emit({ event: 'step_update', step_update: { conversation_id: id, step_index: 1, state: 'ACTIVE', step_type: 'tool', tool_name: 'view_file' } });
 emit({ event: 'step_update', step_update: { conversation_id: id, step_index: 2, state: 'ACTIVE', step_type: 'agent_response', text_delta: 'x' } });
 
-if (prompt === 'slow') {
+if (prompt === 'hold') {
+  // held open until the test creates the file named by FAKE_AGY_RELEASE
+  const { existsSync } = await import('node:fs');
+  while (!existsSync(process.env.FAKE_AGY_RELEASE)) await new Promise((r) => setTimeout(r, 20));
+  result({ response: 'done' });
+} else if (prompt === 'slow') {
   setTimeout(() => result({ response: 'done' }), 300);
 } else if (prompt === 'hang') {
   setTimeout(() => {}, 60_000);
@@ -37,6 +42,10 @@ if (prompt === 'slow') {
   result({ response: 'partial' });
 } else if (prompt === 'fail') {
   result({ conversation_id: '', status: 'ERROR', error: 'invalid model selection', num_turns: 0 });
+} else if (prompt === 'noid') {
+  result({ conversation_id: '', response: 'ok' });
+} else if (prompt === 'denied-camel') {
+  result({ deniedActions: ['RunCommand', { action: 'read', displayName: 'ReadFile' }] });
 } else if (prompt === 'denied') {
   result({ denied_actions: [{ action: 'command', display_name: 'RunCommand' }] });
 } else {

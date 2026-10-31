@@ -6,7 +6,7 @@ It is a thin wrapper: **model, reasoning effort and time limit come from the CLI
 unless a call overrides them.** Nothing is pinned by the server. The exception is permissions, which are
 auto-approved by default because headless runs can't prompt and reviewers need to run commands.
 
-| Setting | Default when not passed | Override |
+| Setting | Default when not passed | Override (on start) |
 |---|---|---|
 | Model | `"model"` in `~/.gemini/antigravity-cli/settings.json` (what `/model` sets) | `model` |
 | Effort | the selected model's default | `effort` (`low`…`max`, validated by the CLI per model) |
@@ -16,7 +16,10 @@ auto-approved by default because headless runs can't prompt and reviewers need t
 ## Tools
 
 - `antigravity`: start a session. Params: `prompt` plus optional `model`, `effort`, `timeout`, `cwd`, `add_dirs`, `mode`, `sandbox`, `dangerously_skip_permissions`.
-- `antigravity-reply`: continue a session by `conversation_id`, with the same optional overrides.
+- `antigravity-reply`: continue a session by `conversation_id`, with optional `prompt`-side overrides `model`, `effort`, `timeout` and `mode`.
+  `cwd`, `add_dirs`, `sandbox` and `dangerously_skip_permissions` are fixed when the conversation starts: a reply that passes a
+  different value is refused (nothing is spawned), an equal or omitted value uses the bound one. Relative `add_dirs` resolve against
+  the conversation's `cwd`. To change them, start a new conversation.
 
 `mode` only offers `accept-edits`. Plan mode is left out on purpose: headless, it blocks running commands and
 reading URLs even with permissions skipped, so the agent returns an empty response.
@@ -37,6 +40,17 @@ finished answer.
 `agy models` lists ids with the effort baked in (`claude-opus-5-5-high`). To pass `effort` separately, use the base id
 (`claude-opus-5-5`) or omit `model` to apply the effort to the CLI's selected model. Combining a suffixed id with `effort`
 is rejected by the CLI and returned as a tool error.
+
+## Operational preconditions
+
+The server checks every call with the hub's grant checker (`AI_GRANT_CHECK`, default `~/ai-cli-sync/bin/grant-check`). It refuses
+every `antigravity` and `antigravity-reply` call when the checker is missing or cannot run, and when the checker denies the call.
+Nothing is sent to `agy` in either case.
+
+- `antigravity` takes an optional `grant`: the id of a grant to run under, passed to the checker.
+- Each conversation is bound to its `cwd`, `add_dirs`, project, grant, `sandbox` and permissions when it starts. The bindings live under
+  `ANTIGRAVITY_MCP_STATE_DIR` (default `~/.local/state/antigravity-mcp/bindings`).
+- Conversations started before this version have no binding and cannot be continued with `antigravity-reply`. Start a new one.
 
 ## Install
 
