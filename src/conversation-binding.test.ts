@@ -169,7 +169,7 @@ describe('grant client', () => {
   it('rejects an exit code that carries no decision', async () => {
     const { grants } = makeChecker({ exit: 3 });
 
-    await expect(grants.check(request)).rejects.toThrow('exited 3');
+    await expect(grants.check(request)).rejects.toThrow(/exited 3.*unscoped test server.*run bin\/plan to see why/);
   });
 
   it('rejects unparseable output without echoing it', async () => {

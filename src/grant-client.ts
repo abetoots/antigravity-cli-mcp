@@ -75,11 +75,14 @@ export class GrantClient {
 
   // exit 0 and 2 carry a decision; anything else -- a missing checker, exit 3 (unreadable
   // registry), a timeout, bad output -- rejects, so callers fail closed. a decision is allowed
-  // only when the exit is 0 AND its json says so. no error here ever carries checker output.
+  // only when the exit is 0 AND its json says so.
   check(req: GrantRequest): Promise<GrantDecision> {
     return new Promise((resolve, reject) => {
-      const child = spawn(this.checkerPath, [], { stdio: ['pipe', 'pipe', 'ignore'] });
+      const child = spawn(this.checkerPath, [], { stdio: ['pipe', 'pipe', 'pipe'] });
       let out = '';
+      let err = '';
+      child.stderr.setEncoding('utf8');
+      child.stderr.on('data', (chunk: string) => { err += chunk; });
       const timer = setTimeout(() => {
         child.kill();
         reject(new Error('grant checker timed out'));
@@ -95,7 +98,7 @@ export class GrantClient {
       child.on('close', (code) => {
         clearTimeout(timer);
         if (code !== 0 && code !== 2) {
-          reject(new Error(`grant checker exited ${code}`));
+          reject(new Error(`grant checker exited ${code}${code === 3 ? `: ${err.trim()} — run bin/plan to see why` : ''}`));
           return;
         }
         let decision: GrantDecision;

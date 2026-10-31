@@ -24,7 +24,7 @@ process.stdin.on("end", () => {
   const n = existsSync(logPath) ? readFileSync(logPath, "utf8").split("\n").filter(Boolean).length : 0;
   appendFileSync(logPath, `${JSON.stringify(request)}\n`);
   const fixture = JSON.parse(readFileSync(join(dir, "fixture.json"), "utf8"));
-  if (fixture.exit !== undefined) process.exit(fixture.exit);
+  if (fixture.exit !== undefined) { if (fixture.exit === 3) process.stderr.write('unscoped test server'); process.exit(fixture.exit); }
   if (fixture.rawStdout !== undefined) {
     process.stdout.write(fixture.rawStdout);
     process.exit(0);
