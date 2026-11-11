@@ -18,6 +18,7 @@ export interface AgyOptions {
   effort?: Effort;
   timeout?: string;
   conversationId?: string;
+  ticketId?: string;
   cwd?: string;
   addDirs?: string[];
   mode?: Mode;
@@ -110,8 +111,12 @@ export function runAgy(opts: AgyOptions, hooks: RunHooks = {}): Promise<AgyResul
   const bin = hooks.bin ?? resolveAgyBinary();
 
   return new Promise((resolve, reject) => {
+    const env = { ...process.env };
+    if (opts.ticketId) env.AI_DELEGATION_TICKET = opts.ticketId;
+    else delete env.AI_DELEGATION_TICKET;
     const child = spawn(bin, args, {
       cwd: opts.cwd,
+      env,
       stdio: ['pipe', 'pipe', 'pipe'],
       signal: hooks.signal,
     });

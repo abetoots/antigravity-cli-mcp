@@ -84,7 +84,9 @@ describe('binding store', () => {
   });
 
   const bad: [string, Record<string, unknown>][] = [
-    ['wrong schema', { schema: 2 }],
+    ['wrong schema', { schema: 3 }],
+    ['invalid ticket', { schema: 2, ticketId: 'bad' }],
+    ['ticket on schema 1', { ticketId: '0123456789abcdef0123456789abcdef' }],
     ['id mismatch', { conversationId: 'other' }],
     ['relative cwd', { cwd: 'rel/path' }],
     ['non-string cwd', { cwd: 5 }],

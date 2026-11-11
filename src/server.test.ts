@@ -11,6 +11,7 @@ import { fromWire, type GrantClient } from './grant-client.js';
 import { createServer } from './server.js';
 
 const FAKE_AGY = resolve(import.meta.dirname, '../test/fake-agy.mjs');
+const FAKE_TICKET = resolve(import.meta.dirname, '../test/fake-ticket-helper.mjs');
 const FAKE_CHECKER = resolve(import.meta.dirname, '../test/fake-grant-check.mjs');
 
 let client: Client;
@@ -83,6 +84,10 @@ beforeEach(async () => {
   process.env.AI_GRANT_CHECK = join(dir, 'grant-check.mjs');
   process.env.ANTIGRAVITY_MCP_STATE_DIR = stateDir;
   process.env.FAKE_AGY_RELEASE = join(dir, 'release');
+  process.env.AI_DELEGATION_TICKET_HELPER = join(dir, 'missing-ticket-helper');
+  process.env.FAKE_TICKET_REQUEST = join(dir, 'ticket-request.json');
+  delete process.env.FAKE_TICKET_MODE;
+  delete process.env.AI_DELEGATION_TICKET;
   agyCalls = [];
   client = await connectServer(agyCalls);
   clients = [client];
@@ -116,6 +121,7 @@ interface Echo {
   argv: string[];
   cwd: string;
   prompt: string;
+  ticket?: string;
 }
 
 function echoed(result: CallToolResult): Echo {
@@ -126,6 +132,91 @@ function echoed(result: CallToolResult): Echo {
 function echoedArgv(result: CallToolResult): string[] {
   return echoed(result).argv;
 }
+
+
+function useTicketHelper(): void {
+  const helper = join(dir, 'ticket-helper.mjs');
+  copyFileSync(FAKE_TICKET, helper);
+  chmodSync(helper, 0o755);
+  process.env.AI_DELEGATION_TICKET_HELPER = helper;
+}
+
+describe('delegation tickets', () => {
+  it('start issues a ticket from the grant decision and agy gets it in its environment', async () => {
+    useTicketHelper();
+    mkdirSync(join(project, 'sub'));
+    setFixture({ decision: wireDecision({ grant_revision: 3, expires_at: '2099-01-01T00:00:00Z' }) });
+    const before = Date.now();
+    const result = await call('antigravity', { prompt: 'hi', cwd: project, add_dirs: ['sub'], grant: 'g1' });
+    const after = Date.now();
+    const request = JSON.parse(readFileSync(process.env.FAKE_TICKET_REQUEST!, 'utf8'));
+    expect(request).toEqual({
+      parent_harness: 'gemini', dispatch_id: expect.stringMatching(/^[0-9a-f-]{36}$/),
+      cwd: project, add_dirs: [join(project, 'sub')], project: 'p1', grant_id: 'g1',
+      revision: 3, effective_hash: 'h1', expires_at: expect.stringMatching(/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/),
+    });
+    expect(Date.parse(request.expires_at)).toBeGreaterThanOrEqual(Math.floor((before + 8 * 3600_000) / 1000) * 1000);
+    expect(Date.parse(request.expires_at)).toBeLessThanOrEqual(Math.floor((after + 8 * 3600_000) / 1000) * 1000);
+    expect(echoed(result).ticket).toBe('0123456789abcdef0123456789abcdef');
+    expect(await loadBinding('conv-123', stateDir)).toMatchObject({ schema: 2, ticketId: '0123456789abcdef0123456789abcdef' });
+  });
+
+  it('uses an earlier grant expiry for the ticket', async () => {
+    useTicketHelper();
+    const expiry = new Date(Math.floor((Date.now() + 3600_000) / 1000) * 1000).toISOString().replace('.000Z', 'Z');
+    setFixture({ decision: wireDecision({ expires_at: expiry }) });
+    await call('antigravity', { prompt: 'hi', cwd: project });
+    expect(JSON.parse(readFileSync(process.env.FAKE_TICKET_REQUEST!, 'utf8')).expires_at).toBe(expiry);
+  });
+
+  it('uses an eight-hour expiry when the grant has none', async () => {
+    useTicketHelper();
+    const before = Date.now();
+    await call('antigravity', { prompt: 'hi', cwd: project });
+    const after = Date.now();
+    const request = JSON.parse(readFileSync(process.env.FAKE_TICKET_REQUEST!, 'utf8'));
+    expect(request.grant_id).toBeNull();
+    expect(request.revision).toBeNull();
+    expect(Date.parse(request.expires_at)).toBeGreaterThanOrEqual(Math.floor((before + 8 * 3600_000) / 1000) * 1000);
+    expect(Date.parse(request.expires_at)).toBeLessThanOrEqual(Math.floor((after + 8 * 3600_000) / 1000) * 1000);
+  });
+
+  it('reply passes the bound ticket', async () => {
+    useTicketHelper();
+    await call('antigravity', { prompt: 'hi', cwd: project });
+    const result = await call('antigravity-reply', { conversation_id: 'conv-123', prompt: 'follow up' });
+    expect(echoed(result).ticket).toBe('0123456789abcdef0123456789abcdef');
+  });
+
+  it.each(['missing', 'exit', 'bad', 'invalid-id'])('ticket helper %s failure starts without a ticket and says delegation is unavailable', async (mode) => {
+    if (mode !== 'missing') { useTicketHelper(); process.env.FAKE_TICKET_MODE = mode; }
+    const result = await call('antigravity', { prompt: 'hi', cwd: project });
+    expect(result.isError).toBe(false);
+    expect((result.content[0] as { text: string }).text.startsWith('Delegation is unavailable for this conversation.\n\n')).toBe(true);
+    expect(echoed(result).ticket).toBeUndefined();
+  });
+
+  it('a failed agy spawn still says delegation is unavailable when ticket issuing fails', async () => {
+    process.env.AGY_BIN = join(dir, 'missing-agy');
+    const result = await call('antigravity', { prompt: 'hi', cwd: project });
+    expect(result.isError).toBe(true);
+    expect((result.content[0] as { text: string }).text.startsWith('Delegation is unavailable for this conversation.\n\n')).toBe(true);
+  });
+
+  it('an inherited ticket variable never reaches agy without a ticket', async () => {
+    process.env.AI_DELEGATION_TICKET = 'inherited';
+    const result = await call('antigravity', { prompt: 'hi', cwd: project });
+    expect(echoed(result).ticket).toBeUndefined();
+  });
+
+  it('schema-1 bindings still resume without an inherited ticket', async () => {
+    process.env.AI_DELEGATION_TICKET = 'inherited';
+    await seed();
+    const result = await call('antigravity-reply', { conversation_id: 'conv-9', prompt: 'hi' });
+    expect(result.isError).toBe(false);
+    expect(echoed(result).ticket).toBeUndefined();
+  });
+});
 
 describe('antigravity tool', () => {
   it('defers model, effort and timeout to the cli when not provided', async () => {

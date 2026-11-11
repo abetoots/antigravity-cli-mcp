@@ -49,5 +49,5 @@ if (prompt === 'hold') {
 } else if (prompt === 'denied') {
   result({ denied_actions: [{ action: 'command', display_name: 'RunCommand' }] });
 } else {
-  result({ response: JSON.stringify({ argv, cwd: process.cwd(), prompt }) });
+  result({ response: JSON.stringify({ argv, cwd: process.cwd(), prompt, ticket: process.env.AI_DELEGATION_TICKET }) });
 }
