@@ -47,6 +47,11 @@ function checkerRequests(): Record<string, unknown>[] {
   }
 }
 
+function ticketRequests(): Record<string, unknown>[] {
+  const log = process.env.FAKE_TICKET_LOG!;
+  return existsSync(log) ? readFileSync(log, 'utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line)) : [];
+}
+
 function binding(over: Partial<ConversationBinding> = {}): ConversationBinding {
   return {
     schema: 1,
@@ -85,7 +90,7 @@ beforeEach(async () => {
   process.env.ANTIGRAVITY_MCP_STATE_DIR = stateDir;
   process.env.FAKE_AGY_RELEASE = join(dir, 'release');
   process.env.AI_DELEGATION_TICKET_HELPER = join(dir, 'missing-ticket-helper');
-  process.env.FAKE_TICKET_REQUEST = join(dir, 'ticket-request.json');
+  process.env.FAKE_TICKET_LOG = join(dir, 'ticket-requests.log');
   delete process.env.FAKE_TICKET_MODE;
   delete process.env.AI_DELEGATION_TICKET;
   agyCalls = [];
@@ -149,7 +154,7 @@ describe('delegation tickets', () => {
     const before = Date.now();
     const result = await call('antigravity', { prompt: 'hi', cwd: project, add_dirs: ['sub'], grant: 'g1' });
     const after = Date.now();
-    const request = JSON.parse(readFileSync(process.env.FAKE_TICKET_REQUEST!, 'utf8'));
+    const [request] = ticketRequests();
     expect(request).toEqual({
       parent_harness: 'gemini', dispatch_id: expect.stringMatching(/^[0-9a-f-]{36}$/),
       cwd: project, add_dirs: [join(project, 'sub')], project: 'p1', grant_id: 'g1',
@@ -157,8 +162,8 @@ describe('delegation tickets', () => {
     });
     expect(Date.parse(request.expires_at)).toBeGreaterThanOrEqual(Math.floor((before + 8 * 3600_000) / 1000) * 1000);
     expect(Date.parse(request.expires_at)).toBeLessThanOrEqual(Math.floor((after + 8 * 3600_000) / 1000) * 1000);
-    expect(echoed(result).ticket).toBe('0123456789abcdef0123456789abcdef');
-    expect(await loadBinding('conv-123', stateDir)).toMatchObject({ schema: 2, ticketId: '0123456789abcdef0123456789abcdef' });
+    expect(echoed(result).ticket).toMatch(/^[0-9a-f]{32}$/);
+    expect(await loadBinding('conv-123', stateDir)).toMatchObject({ schema: 2, ticketId: echoed(result).ticket });
   });
 
   it('uses an earlier grant expiry for the ticket', async () => {
@@ -166,7 +171,7 @@ describe('delegation tickets', () => {
     const expiry = new Date(Math.floor((Date.now() + 3600_000) / 1000) * 1000).toISOString().replace('.000Z', 'Z');
     setFixture({ decision: wireDecision({ expires_at: expiry }) });
     await call('antigravity', { prompt: 'hi', cwd: project });
-    expect(JSON.parse(readFileSync(process.env.FAKE_TICKET_REQUEST!, 'utf8')).expires_at).toBe(expiry);
+    expect(ticketRequests()[0].expires_at).toBe(expiry);
   });
 
   it('uses an eight-hour expiry when the grant has none', async () => {
@@ -174,18 +179,31 @@ describe('delegation tickets', () => {
     const before = Date.now();
     await call('antigravity', { prompt: 'hi', cwd: project });
     const after = Date.now();
-    const request = JSON.parse(readFileSync(process.env.FAKE_TICKET_REQUEST!, 'utf8'));
+    const [request] = ticketRequests();
     expect(request.grant_id).toBeNull();
     expect(request.revision).toBeNull();
     expect(Date.parse(request.expires_at)).toBeGreaterThanOrEqual(Math.floor((before + 8 * 3600_000) / 1000) * 1000);
     expect(Date.parse(request.expires_at)).toBeLessThanOrEqual(Math.floor((after + 8 * 3600_000) / 1000) * 1000);
   });
 
-  it('reply passes the bound ticket', async () => {
+  it('reply reuses the bound ticket without issuing another', async () => {
     useTicketHelper();
-    await call('antigravity', { prompt: 'hi', cwd: project });
+    const start = await call('antigravity', { prompt: 'hi', cwd: project });
+    const bound = await loadBinding('conv-123', stateDir);
     const result = await call('antigravity-reply', { conversation_id: 'conv-123', prompt: 'follow up' });
-    expect(echoed(result).ticket).toBe('0123456789abcdef0123456789abcdef');
+    expect(ticketRequests()).toHaveLength(1);
+    expect(echoed(result).ticket).toMatch(/^[0-9a-f]{32}$/);
+    expect(echoed(result).ticket).toBe(bound?.ticketId);
+    expect(echoed(result).ticket).toBe(echoed(start).ticket);
+  });
+
+  it('does not issue a ticket when the grant is refused', async () => {
+    useTicketHelper();
+    setFixture({ decision: wireDecision({ allowed: false, reason: 'revoked' }) });
+    const result = await call('antigravity', { prompt: 'hi', cwd: project, grant: 'g1' });
+    expect(result.isError).toBe(true);
+    expect(ticketRequests()).toHaveLength(0);
+    expect(agyCalls).toHaveLength(0);
   });
 
   it.each(['missing', 'exit', 'bad', 'invalid-id'])('ticket helper %s failure starts without a ticket and says delegation is unavailable', async (mode) => {
