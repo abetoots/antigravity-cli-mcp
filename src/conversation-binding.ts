@@ -7,7 +7,8 @@ import { homedir } from 'node:os';
 import { isAbsolute, join } from 'node:path';
 
 export interface ConversationBinding {
-  schema: 1;
+  schema: 1 | 2;
+  ticketId?: string;
   conversationId: string;
   cwd: string;
   addDirs: string[];
@@ -40,8 +41,9 @@ const isIntOrNull = (v: unknown): boolean => v === null || (typeof v === 'number
 
 function validate(conversationId: string, value: unknown): ConversationBinding {
   const b = value as Partial<Record<keyof ConversationBinding, unknown>> | null;
-  if (typeof b !== 'object' || b === null || b.schema !== 1) throw new BindingUnreadable(conversationId, 'wrong schema');
+  if (typeof b !== 'object' || b === null || (b.schema !== 1 && b.schema !== 2)) throw new BindingUnreadable(conversationId, 'wrong schema');
   const ok =
+    (b.schema === 1 ? b.ticketId === undefined : b.ticketId === undefined || (typeof b.ticketId === 'string' && /^[0-9a-f]{32}$/.test(b.ticketId))) &&
     b.conversationId === conversationId &&
     typeof b.cwd === 'string' &&
     isAbsolute(b.cwd) &&

@@ -1,12 +1,14 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { RequestHandlerExtra } from '@modelcontextprotocol/sdk/shared/protocol.js';
 import type { CallToolResult, ServerNotification, ServerRequest } from '@modelcontextprotocol/sdk/types.js';
+import { randomUUID } from 'node:crypto';
 import { realpathSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { z } from 'zod';
 import { runAgy as defaultRunAgy, type AgyOptions, type AgyResult, type StepUpdate } from './agy.js';
 import { BindingUnreadable, loadBinding, saveBinding } from './conversation-binding.js';
 import { GrantClient, defaultCheckerPath, type GrantDecision } from './grant-client.js';
+import { issueTicket } from './ticket-client.js';
 
 type ToolExtra = RequestHandlerExtra<ServerRequest, ServerNotification>;
 
@@ -174,7 +176,7 @@ const refusal = (text: string): CallToolResult => ({ content: [{ type: 'text', t
 
 // what the handler decided before spawning agy: either a refusal, or the options to run with and
 // what to do with the result
-type Prepared = CallToolResult | { opts: AgyOptions; finish: (result: AgyResult) => Promise<CallToolResult> };
+type Prepared = CallToolResult | { opts: AgyOptions; finish: (result: AgyResult) => Promise<CallToolResult>; delegationUnavailable?: boolean };
 
 export interface ServerDeps {
   keepaliveMs?: number;
@@ -231,16 +233,25 @@ export function createServer({ keepaliveMs = KEEPALIVE_MS, runAgy = defaultRunAg
     const go = async (): Promise<CallToolResult> => {
       const prepared = await prepare();
       if ('content' in prepared) return prepared;
-      const result = await runAgy(prepared.opts, {
-        signal: extra.signal,
-        onStep: (step) => {
-          const message = describeStep(step);
-          if (!message) return;
-          lastMessage = message;
-          notify(message);
-        },
-      });
-      return prepared.finish(result);
+      let result: CallToolResult;
+      try {
+        const agyResult = await runAgy(prepared.opts, {
+          signal: extra.signal,
+          onStep: (step) => {
+            const message = describeStep(step);
+            if (!message) return;
+            lastMessage = message;
+            notify(message);
+          },
+        });
+        result = await prepared.finish(agyResult);
+      } catch (err) {
+        result = refusal((err as Error).message);
+      }
+      if (prepared.delegationUnavailable && result.content[0]?.type === 'text') {
+        result.content[0].text = `Delegation is unavailable for this conversation.\n\n${result.content[0].text}`;
+      }
+      return result;
     };
     try {
       return await (chainKey === undefined ? go() : enqueue(chainKey, go));
@@ -252,6 +263,7 @@ export function createServer({ keepaliveMs = KEEPALIVE_MS, runAgy = defaultRunAg
   };
 
   const start = async (args: SharedArgs & { grant?: string }): Promise<Prepared> => {
+    const dispatchId = randomUUID();
     const cwd = resolvePath(args.cwd ?? process.cwd());
     const addDirs = (args.add_dirs ?? []).map((d) => resolvePath(d, cwd));
     const sandbox = args.sandbox === true;
@@ -266,8 +278,21 @@ export function createServer({ keepaliveMs = KEEPALIVE_MS, runAgy = defaultRunAg
       boundProject: null,
     });
     if ('content' in decision) return decision;
+    let ticketId: string | undefined;
+    try {
+      const deadline = Date.now() + 8 * 60 * 60 * 1000;
+      const expiry = decision.expiresAt === null ? deadline : Math.min(deadline, Date.parse(decision.expiresAt));
+      ticketId = await issueTicket({
+        parent_harness: 'gemini', dispatch_id: dispatchId, cwd, add_dirs: addDirs,
+        project: decision.project, grant_id: args.grant ?? null, revision: decision.grantRevision,
+        effective_hash: decision.effectiveHash, expires_at: new Date(expiry).toISOString().replace(/\.\d{3}Z$/, 'Z'),
+      });
+    } catch {
+      // A failed ticket leaves the conversation usable but without delegation.
+    }
     return {
-      opts: { ...toAgyOptions(args), cwd, addDirs, sandbox, dangerouslySkipPermissions: skipPermissions },
+      delegationUnavailable: ticketId === undefined,
+      opts: { ...toAgyOptions(args), cwd, addDirs, sandbox, dangerouslySkipPermissions: skipPermissions, ticketId },
       finish: async (result) => {
         if (!result.conversation_id) {
           // nothing to bind: a failed run is reported as such, a successful one cannot be continued safely
@@ -276,7 +301,8 @@ export function createServer({ keepaliveMs = KEEPALIVE_MS, runAgy = defaultRunAg
         }
         try {
           await saveBinding({
-            schema: 1,
+            schema: 2,
+            ...(ticketId === undefined ? {} : { ticketId }),
             conversationId: result.conversation_id,
             cwd,
             addDirs,
@@ -344,6 +370,7 @@ export function createServer({ keepaliveMs = KEEPALIVE_MS, runAgy = defaultRunAg
         addDirs: bound.addDirs,
         sandbox: bound.sandbox,
         dangerouslySkipPermissions: bound.skipPermissions,
+        ticketId: bound.ticketId,
       },
       finish: async (result) => formatResult(result),
     };
